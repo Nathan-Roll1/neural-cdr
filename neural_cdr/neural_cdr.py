@@ -748,11 +748,25 @@ def run_neural_cdr(X, y,
             raise ValueError("No suitable merge columns found for X and y")
         
         # Remove response from X if it exists to avoid duplication
-        if response_col in X.columns:
-            X = X.drop(columns=[response_col])
+        X_clean = X.copy()
+        if response_col in X_clean.columns:
+            X_clean = X_clean.drop(columns=[response_col])
+        
+        # Only keep necessary columns from X for the merge
+        X_cols_needed = predictor_cols + merge_cols
+        X_cols_needed = list(dict.fromkeys(X_cols_needed))  # Remove duplicates
+        X_subset = X_clean[X_cols_needed].copy()
+        
+        # Keep response and merge columns from y
+        y_cols_needed = [response_col] + merge_cols
+        y_cols_needed = list(dict.fromkeys(y_cols_needed))
+        y_subset = y[y_cols_needed].copy()
+        
+        print(f"Columns kept from X: {X_cols_needed}")
+        print(f"Columns kept from y: {y_cols_needed}")
         
         # Merge
-        data_full = pd.merge(X, y, on=merge_cols, how='inner')
+        data_full = pd.merge(X_subset, y_subset, on=merge_cols, how='inner')
         
         # Filter invalid response times early
         data_full = data_full[data_full[response_col] > 0].reset_index(drop=True)
@@ -795,11 +809,13 @@ def run_neural_cdr(X, y,
         print(f"Validation observations: {len(val_data_df)}")
         
         # Recreate X and y for each split
-        X_train = train_data_df[X.columns]
-        y_train = train_data_df[[response_col] + merge_cols]
+        # X should contain predictor columns and merge columns
+        # y should contain response column and merge columns
+        X_train = train_data_df[X_cols_needed]
+        y_train = train_data_df[y_cols_needed]
         
-        X_val = val_data_df[X.columns]
-        y_val = val_data_df[[response_col] + merge_cols]
+        X_val = val_data_df[X_cols_needed]
+        y_val = val_data_df[y_cols_needed]
         
         # Prepare training data and compute normalization parameters
         print("\n--- Preparing TRAINING data ---")

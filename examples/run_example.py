@@ -3,6 +3,7 @@ Example Neural CDR Analysis
 ===========================
 
 This script demonstrates how to use Neural CDR on reading time data.
+UPDATED: Shows how to use the prevent_leakage option for unbiased validation.
 """
 
 # If running from examples/ directory, add parent to path
@@ -28,10 +29,6 @@ def main():
     # Example with CSV files:
     # X = pd.read_csv('path/to/predictors.csv')
     # y = pd.read_csv('path/to/readingtimes.csv')
-    
-    # Example with pickle files:
-    # X = pd.read_pickle('dundee_predictors.pkl')
-    # y = pd.read_pickle('dundee_readingtimes.pkl')
     
     # For this example, let's create synthetic data
     print("Creating synthetic data for demonstration...")
@@ -71,30 +68,76 @@ def main():
     print(f"Created {n_obs} observations across {n_sentences} sentences")
     
     # =========================================================================
-    # RUN NEURAL CDR ANALYSIS
+    # COMPARISON: WITH AND WITHOUT LEAKAGE PREVENTION
     # =========================================================================
     
-    # Basic analysis with default parameters
     print("\n" + "="*80)
-    print("RUNNING BASIC ANALYSIS WITH DEFAULT PARAMETERS")
+    print("ANALYSIS 1: WITH POTENTIAL LEAKAGE (OLD METHOD)")
     print("="*80)
     
-    results_basic = run_neural_cdr(
+    results_with_leakage = run_neural_cdr(
         X, y,
         predictor_cols=['surprisal'],
         response_col='fdur',
-        visualize=True
+        n_epochs=30,  # Fewer epochs for demo
+        prevent_leakage=False,  # OLD METHOD
+        visualize=False  # Skip visualization for comparison
     )
     
-    print(f"\nBasic analysis complete!")
-    print(f"Final validation R²: {results_basic['results']['r2']:.4f}")
+    print(f"\nResults WITH potential leakage:")
+    print(f"  Final validation R²: {results_with_leakage['history']['val_r2'][-1]:.4f}")
+    print(f"  Best validation R²: {max(results_with_leakage['history']['val_r2']):.4f}")
     
     # =========================================================================
-    # ADVANCED ANALYSIS WITH CUSTOM PARAMETERS
+    # ANALYSIS 2: WITHOUT LEAKAGE (RECOMMENDED)
     # =========================================================================
     
     print("\n" + "="*80)
-    print("RUNNING ADVANCED ANALYSIS WITH CUSTOM PARAMETERS")
+    print("ANALYSIS 2: WITHOUT LEAKAGE (RECOMMENDED METHOD)")
+    print("="*80)
+    
+    results_no_leakage = run_neural_cdr(
+        X, y,
+        predictor_cols=['surprisal'],
+        response_col='fdur',
+        n_epochs=30,  # Fewer epochs for demo
+        prevent_leakage=True,  # NEW METHOD (default)
+        split_by='sentence',   # Split by sentences
+        visualize=True
+    )
+    
+    print(f"\nResults WITHOUT leakage:")
+    print(f"  Final validation R²: {results_no_leakage['history']['val_r2'][-1]:.4f}")
+    print(f"  Best validation R²: {max(results_no_leakage['history']['val_r2']):.4f}")
+    
+    # =========================================================================
+    # COMPARE RESULTS
+    # =========================================================================
+    
+    print("\n" + "="*80)
+    print("COMPARISON")
+    print("="*80)
+    
+    r2_with_leakage = max(results_with_leakage['history']['val_r2'])
+    r2_no_leakage = max(results_no_leakage['history']['val_r2'])
+    
+    inflation = (r2_with_leakage - r2_no_leakage) / r2_no_leakage * 100
+    
+    print(f"\nBest R² with potential leakage: {r2_with_leakage:.4f}")
+    print(f"Best R² without leakage: {r2_no_leakage:.4f}")
+    print(f"Estimated inflation: {inflation:.1f}%")
+    
+    if inflation > 10:
+        print("\n⚠️  Significant inflation detected! Always use prevent_leakage=True")
+    else:
+        print("\n✓  Minimal inflation in this dataset")
+    
+    # =========================================================================
+    # ADVANCED USAGE WITH MULTIPLE PREDICTORS
+    # =========================================================================
+    
+    print("\n" + "="*80)
+    print("ADVANCED ANALYSIS WITH MULTIPLE PREDICTORS")
     print("="*80)
     
     results_advanced = run_neural_cdr(
@@ -102,98 +145,64 @@ def main():
         predictor_cols=['surprisal', 'wordlen', 'freq'],
         response_col='fdur',
         # Model architecture
-        history_length=7,          # Look back 7 words
-        hidden_size=64,           # Larger IRF networks
-        combiner_size=64,         # Larger combiner
-        dropout=0.2,              # More dropout
+        history_length=7,
+        hidden_size=64,
+        combiner_size=64,
+        dropout=0.2,
         # Training settings
-        batch_size=2048,          # Larger batches
-        n_epochs=100,             # More epochs
-        learning_rate=0.005,      # Lower learning rate
-        weight_decay=1e-3,        # More regularization
+        batch_size=2048,
+        n_epochs=50,
+        learning_rate=0.005,
+        weight_decay=1e-3,
         early_stopping_patience=20,
-        # Data preprocessing
-        outlier_percentile=98.0,  # More aggressive outlier handling
+        # Data settings
+        outlier_percentile=98.0,
         use_log_transform=True,
         test_size=0.2,
+        # IMPORTANT: Always use these for real analyses
+        prevent_leakage=True,
+        split_by='sentence',
         # Other
         device='cuda',
         visualize=True
     )
     
     print(f"\nAdvanced analysis complete!")
-    print(f"Final validation R²: {results_advanced['results']['r2']:.4f}")
-    
-    # =========================================================================
-    # WORKING WITH THE RESULTS
-    # =========================================================================
-    
-    # Extract the trained model
-    model = results_advanced['model']
-    
-    # Get normalization parameters for denormalizing predictions
-    norm_params = results_advanced['normalization_params']
-    
-    # Access training history
-    history = results_advanced['history']
-    print(f"\nBest epoch: {np.argmin(history['val_loss'])}")
-    print(f"Best validation loss: {min(history['val_loss']):.4f}")
-    
-    # Get IRF curves for specific predictors
-    print("\nExtracting IRF curves...")
-    
-    for predictor_idx, predictor_name in enumerate(['surprisal', 'wordlen', 'freq']):
-        curves = model.get_irf_curves(
-            predictor_idx=predictor_idx,
-            t_range=(0, 7),  # Match history_length
-            n_points=100,
-            predictor_values=[-2, -1, 0, 1, 2]
-        )
-        
-        print(f"\nIRF curves for {predictor_name}:")
-        for name, curve_data in curves.items():
-            # Find peak effect
-            peak_idx = np.argmax(np.abs(curve_data['irf']))
-            peak_time = curve_data['time'][peak_idx]
-            peak_value = curve_data['irf'][peak_idx]
-            print(f"  {name}: peak effect = {peak_value:.3f} at lag = {peak_time:.2f} words")
+    print(f"Final validation R² (no leakage): {results_advanced['results']['r2']:.4f}")
     
     # =========================================================================
     # MAKING PREDICTIONS ON NEW DATA
     # =========================================================================
     
     print("\n" + "="*80)
-    print("MAKING PREDICTIONS ON NEW DATA")
+    print("USING THE MODEL FOR PREDICTIONS")
     print("="*80)
     
-    # Note: For real prediction on new data, you would need to:
-    # 1. Prepare the new data using the same preprocessing pipeline
-    # 2. Create windows using the same history_length
-    # 3. Normalize using the saved normalization parameters
-    # 4. Run the model forward pass
-    # 5. Denormalize the predictions
+    # When using prevent_leakage=True, normalization parameters are computed
+    # only on training data, which is what you want for deployment
     
-    # Note: In a real application, you would need to track validation indices
-    # For this example, we'll just show how to work with the results
+    model = results_advanced['model']
+    norm_params = results_advanced['normalization_params']
     
-    # The predictions are already computed in results
-    predictions_normalized = results_advanced['results']['predictions']
+    print("\nNormalization parameters (computed on training data only):")
+    print(f"  Response mean: {norm_params['response_mean']:.2f}")
+    print(f"  Response std: {norm_params['response_std']:.2f}")
+    print(f"  Outlier cap: {norm_params['cap_value']:.2f}")
     
-    # Denormalize predictions
-    predictions_original_scale = (predictions_normalized * norm_params['response_std'] + 
-                                 norm_params['response_mean'])
-    
-    # If log transform was used, reverse it
-    if norm_params['use_log_transform']:
-        predictions_original_scale = np.expm1(predictions_original_scale)
-    
-    print(f"Prediction statistics (original scale):")
-    print(f"  Mean: {predictions_original_scale.mean():.1f} ms")
-    print(f"  Std: {predictions_original_scale.std():.1f} ms")
-    print(f"  Range: [{predictions_original_scale.min():.1f}, "
-          f"{predictions_original_scale.max():.1f}] ms")
+    # For deployment, you would:
+    # 1. Save these normalization parameters
+    # 2. Apply them to any new data
+    # 3. Create windows for the new data
+    # 4. Run predictions
     
     print("\nAnalysis complete!")
+    print("\n" + "="*80)
+    print("KEY TAKEAWAYS")
+    print("="*80)
+    print("1. Always use prevent_leakage=True for unbiased validation")
+    print("2. Split by sentences when possible (split_by='sentence')")
+    print("3. The reported R² is now trustworthy for publication")
+    print("4. Normalization parameters are computed on training data only")
 
 
 if __name__ == "__main__":

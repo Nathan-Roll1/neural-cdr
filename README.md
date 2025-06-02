@@ -1,4 +1,8 @@
 # Getting Started with Neural CDR
+## Install
+```bash
+pip install git+https://github.com/Nathan-Roll1/neural-cdr
+```
 
 ## Quick Example
 

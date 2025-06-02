@@ -3,6 +3,7 @@ Neural Continuous-Time Deconvolutional Regression (Neural CDR)
 =============================================================
 
 Core implementation of Neural CDR with learned impulse response functions.
+UPDATED VERSION: Fixes target leakage issues
 """
 
 import torch
@@ -205,15 +206,20 @@ class ImprovedBlockLinearCDR(nn.Module):
 
 
 # =============================================================================
-# DATA PREPARATION
+# DATA PREPARATION - UPDATED TO PREVENT LEAKAGE
 # =============================================================================
 
 def prepare_reading_data_for_cdr(X, y, predictor_cols, response_col='fdur',
                                 history_length=5, future_length=0,
                                 device='cuda', outlier_percentile=99.0,
-                                use_log_transform=True):
+                                use_log_transform=True,
+                                # NEW PARAMETERS
+                                compute_normalization=True,
+                                existing_normalization_params=None):
     """
     Prepare reading time data with fast window processing and outlier handling
+    
+    UPDATED: Can now use pre-computed normalization parameters to prevent leakage
     
     Args:
         X: DataFrame with predictors
@@ -225,6 +231,8 @@ def prepare_reading_data_for_cdr(X, y, predictor_cols, response_col='fdur',
         device: PyTorch device
         outlier_percentile: Percentile for outlier capping
         use_log_transform: Whether to log-transform response
+        compute_normalization: Whether to compute new normalization parameters
+        existing_normalization_params: Pre-computed normalization params (for validation data)
         
     Returns:
         Dictionary with processed data and normalization parameters
@@ -274,14 +282,6 @@ def prepare_reading_data_for_cdr(X, y, predictor_cols, response_col='fdur',
     data = pd.merge(X_subset, y_subset, on=merge_cols, how='inner')
     print(f"  Merge completed in {time.time() - merge_start:.1f} seconds")
 
-    # Validate response values
-    print(f"\n{response_col} statistics before filtering:")
-    print(f"  Mean: {data[response_col].mean():.2f}")
-    print(f"  Std: {data[response_col].std():.2f}")
-    print(f"  Min: {data[response_col].min():.2f}")
-    print(f"  Max: {data[response_col].max():.2f}")
-    print(f"  % zeros: {(data[response_col] == 0).mean() * 100:.1f}%")
-
     # Filter invalid response times
     initial_len = len(data)
     data = data[data[response_col] > 0].reset_index(drop=True)
@@ -291,36 +291,30 @@ def prepare_reading_data_for_cdr(X, y, predictor_cols, response_col='fdur',
         raise ValueError("No valid data remaining after filtering!")
 
     # Handle outliers
-    print(f"\n*** OUTLIER HANDLING ***")
     original_response = data[response_col].values
 
-    # Show percentiles
-    print("Original percentiles:")
-    for p in [50, 90, 95, 99, 99.9, 100]:
-        print(f"  {p:5.1f}%: {np.percentile(original_response, p):10.1f} ms")
+    # Use existing cap value or compute new one
+    if existing_normalization_params and 'cap_value' in existing_normalization_params:
+        cap_value = existing_normalization_params['cap_value']
+        print(f"\nUsing existing cap value: {cap_value:.1f}")
+    else:
+        cap_value = None
+        if outlier_percentile < 100:
+            cap_value = np.percentile(original_response, outlier_percentile)
+            print(f"\nCapping outliers at {outlier_percentile}th percentile ({cap_value:.1f})")
 
-    # Cap outliers
-    cap_value = None
-    if outlier_percentile < 100:
-        cap_value = np.percentile(original_response, outlier_percentile)
+    if cap_value:
         data['response_capped'] = np.clip(data[response_col], 0, cap_value)
-        print(f"\nCapping outliers at {outlier_percentile}th percentile ({cap_value:.1f} ms)")
-        print(f"  Affected rows: {(data[response_col] > cap_value).sum()} ({(data[response_col] > cap_value).mean()*100:.2f}%)")
     else:
         data['response_capped'] = data[response_col]
 
     # Apply log transform if requested
     if use_log_transform:
         data['response_transformed'] = np.log1p(data['response_capped'])
-        print(f"\nApplied log1p transform")
         response_col_final = 'response_transformed'
     else:
         data['response_transformed'] = data['response_capped']
         response_col_final = 'response_transformed'
-
-    print(f"\nTransformed statistics:")
-    print(f"  Mean: {data[response_col_final].mean():.4f}")
-    print(f"  Std: {data[response_col_final].std():.4f}")
 
     # Sort data
     sort_cols = []
@@ -332,12 +326,10 @@ def prepare_reading_data_for_cdr(X, y, predictor_cols, response_col='fdur',
         sort_cols.append('sentpos')
 
     if sort_cols:
-        print(f"  Sorting by: {sort_cols}")
         data = data.sort_values(sort_cols).reset_index(drop=True)
 
     # Add time column if missing
     if 'time' not in data.columns:
-        print("  Creating time column from row indices")
         data['time'] = np.arange(len(data))
 
     # Get sentid
@@ -348,35 +340,25 @@ def prepare_reading_data_for_cdr(X, y, predictor_cols, response_col='fdur',
 
     n_obs = len(data)
     n_predictors = len(predictor_cols)
-    window_size = history_length + future_length
-
-    print(f"\nProcessing {n_obs:,} observations")
-    print(f"Window size: {window_size}")
 
     # Prepare data
     times = data['time'].values.astype(np.float32)
     predictor_data = data[predictor_cols].fillna(0).values.astype(np.float32)
 
-    # Check for extreme values in predictors
-    print(f"\n  Predictor statistics before normalization:")
-    for i, col in enumerate(predictor_cols):
-        col_data = predictor_data[:, i]
-        print(f"    {col}: mean={col_data.mean():.4f}, std={col_data.std():.4f}, "
-              f"range=[{col_data.min():.4f}, {col_data.max():.4f}]")
-
-        # Clip extreme values
-        extreme_count = ((col_data < -100) | (col_data > 100)).sum()
-        if extreme_count > 0:
-            print(f"      WARNING: {extreme_count} extreme values (|x| > 100)")
-            predictor_data[:, i] = np.clip(col_data, -100, 100)
-
     # Normalize predictors
-    predictor_means = predictor_data.mean(axis=0)
-    predictor_stds = predictor_data.std(axis=0) + 1e-8
+    if compute_normalization:
+        predictor_means = predictor_data.mean(axis=0)
+        predictor_stds = predictor_data.std(axis=0) + 1e-8
+        print("  Computed new predictor normalization parameters")
+    else:
+        predictor_means = existing_normalization_params['predictor_means']
+        predictor_stds = existing_normalization_params['predictor_stds']
+        print("  Using existing predictor normalization parameters")
+
     predictor_data = (predictor_data - predictor_means) / predictor_stds
 
     # Create windows
-    print("\nCreating time-lagged windows (optimized)...")
+    print("\nCreating time-lagged windows...")
     window_start_time = time.time()
 
     if NUMBA_AVAILABLE:
@@ -391,11 +373,6 @@ def prepare_reading_data_for_cdr(X, y, predictor_cols, response_col='fdur',
 
     print(f"  Window creation completed in {time.time() - window_start_time:.1f} seconds")
 
-    # Debug window statistics
-    print("\n  Window statistics:")
-    print(f"    Predictors shape: {predictors_np.shape}")
-    print(f"    Non-zero mask elements: {(mask_np > 0).sum()} / {mask_np.size}")
-
     # Convert to PyTorch tensors
     predictors = torch.from_numpy(predictors_np).to(device, non_blocking=True)
     t_delta = torch.from_numpy(t_delta_np).to(device, non_blocking=True)
@@ -403,20 +380,19 @@ def prepare_reading_data_for_cdr(X, y, predictor_cols, response_col='fdur',
 
     # Normalize response
     response_values = data[response_col_final].values.astype(np.float32)
-    response_mean = float(response_values.mean())
-    response_std = float(response_values.std())
-
-    if response_std < 1e-6:
-        print(f"WARNING: Response std is very small ({response_std}), using 1.0")
-        response_std = 1.0
+    
+    if compute_normalization:
+        response_mean = float(response_values.mean())
+        response_std = float(response_values.std())
+        if response_std < 1e-6:
+            response_std = 1.0
+        print("  Computed new response normalization parameters")
+    else:
+        response_mean = existing_normalization_params['response_mean']
+        response_std = existing_normalization_params['response_std']
+        print("  Using existing response normalization parameters")
 
     response_normalized = (response_values - response_mean) / response_std
-
-    print(f"\nNormalization check:")
-    print(f"  Before: mean={response_mean:.4f}, std={response_std:.4f}")
-    print(f"  After: mean={response_normalized.mean():.6f}, std={response_normalized.std():.6f}")
-
-    # Convert to tensor
     response = torch.tensor(response_normalized, dtype=torch.float32, device=device)
 
     print(f"\nTotal data preparation time: {time.time() - start_time:.1f} seconds")
@@ -424,7 +400,7 @@ def prepare_reading_data_for_cdr(X, y, predictor_cols, response_col='fdur',
     # Create metadata
     metadata = pd.DataFrame({
         response_col: data[response_col].values,
-        'response_capped': data['response_capped'].values if 'response_capped' in data else data[response_col].values,
+        'response_capped': data['response_capped'].values,
         'response_transformed': data[response_col_final].values,
         'response_normalized': response.cpu().numpy()
     })
@@ -685,7 +661,7 @@ def train_model(train_data, val_data, model_params, training_params):
 
 
 # =============================================================================
-# MAIN WRAPPER FUNCTION
+# MAIN WRAPPER FUNCTION - UPDATED TO PREVENT LEAKAGE
 # =============================================================================
 
 def run_neural_cdr(X, y, 
@@ -710,53 +686,40 @@ def run_neural_cdr(X, y,
                   random_state=42,
                   # Other options
                   device='cuda',
-                  visualize=True):
+                  visualize=True,
+                  # NEW: Leakage prevention
+                  prevent_leakage=True,
+                  split_by='sentence'):  # 'sentence' or 'observation'
     """
     Complete Neural CDR analysis with all hyperparameter options
     
+    UPDATED: Now includes option to prevent target leakage by proper data splitting
+    
     Args:
-        X: DataFrame with predictors
-        y: DataFrame with responses
-        predictor_cols: List of predictor column names
-        response_col: Name of response column (default: 'fdur')
-        
-        Model hyperparameters:
-        history_length: Number of previous observations to include (default: 5)
-        future_length: Number of future observations to include (default: 0)
-        hidden_size: Hidden layer size for IRF networks (default: 32)
-        combiner_size: Hidden layer size for combiner network (default: 32)
-        dropout: Dropout rate (default: 0.1)
-        
-        Training hyperparameters:
-        batch_size: Batch size for training (default: 1024)
-        n_epochs: Number of training epochs (default: 50)
-        learning_rate: Learning rate (default: 0.01)
-        weight_decay: Weight decay for AdamW (default: 1e-4)
-        early_stopping_patience: Epochs to wait before early stopping (default: 15)
-        
-        Data preprocessing:
-        outlier_percentile: Percentile for outlier capping (default: 99.0)
-        use_log_transform: Whether to log-transform response (default: True)
-        test_size: Fraction of data for validation (default: 0.2)
-        random_state: Random seed (default: 42)
-        
-        Other options:
-        device: PyTorch device (default: 'cuda')
-        visualize: Whether to create visualizations (default: True)
+        (same as before)
+        prevent_leakage: If True, splits data properly to avoid target leakage (default: True)
+        split_by: How to split data - 'sentence' or 'observation' (default: 'sentence')
         
     Returns:
         Dictionary containing:
         - model: Trained Neural CDR model
-        - data: Processed data dictionary
+        - data: Processed data dictionary (training data if prevent_leakage=True)
         - history: Training history
         - results: Analysis results (if visualize=True)
         - normalization_params: Parameters for denormalizing predictions
+        - val_data: Validation data (if prevent_leakage=True)
     """
     
     print("=" * 80)
     print("NEURAL CONTINUOUS-TIME DECONVOLUTIONAL REGRESSION")
     print("=" * 80)
-    print(f"\nUsing acceleration: {'Numba' if NUMBA_AVAILABLE else 'NumPy vectorization'}")
+    
+    if prevent_leakage:
+        print("\n*** LEAKAGE PREVENTION MODE ENABLED ***")
+        print(f"Splitting data by: {split_by}")
+    else:
+        print("\n*** WARNING: Running with potential target leakage ***")
+        print("Set prevent_leakage=True for unbiased validation metrics")
     
     # Set CUDA settings
     if torch.cuda.is_available():
@@ -766,41 +729,170 @@ def run_neural_cdr(X, y,
         torch.cuda.empty_cache()
         gc.collect()
     
-    # Prepare data
     total_start = time.time()
     
-    cdr_data = prepare_reading_data_for_cdr(
-        X, y,
-        predictor_cols=predictor_cols,
-        response_col=response_col,
-        history_length=history_length,
-        future_length=future_length,
-        outlier_percentile=outlier_percentile,
-        use_log_transform=use_log_transform,
-        device=device
-    )
-    
-    print(f"\nTotal valid observations: {len(cdr_data['response']):,}")
-    
-    # Split data
-    n_obs = len(cdr_data['response'])
-    indices = np.arange(n_obs)
-    train_idx, val_idx = train_test_split(indices, test_size=test_size, random_state=random_state)
-    
-    # Create train/val splits
-    train_data = {
-        'response': cdr_data['response'][train_idx],
-        'predictors': cdr_data['predictors'][train_idx],
-        't_delta': cdr_data['t_delta'][train_idx],
-        'mask': cdr_data['mask'][train_idx]
-    }
-    
-    val_data = {
-        'response': cdr_data['response'][val_idx],
-        'predictors': cdr_data['predictors'][val_idx],
-        't_delta': cdr_data['t_delta'][val_idx],
-        'mask': cdr_data['mask'][val_idx]
-    }
+    if prevent_leakage:
+        # =====================================================================
+        # NEW: PROPER DATA SPLITTING TO PREVENT LEAKAGE
+        # =====================================================================
+        
+        # First merge X and y to ensure we have all data together
+        print("\nMerging X and y for proper splitting...")
+        
+        # Find merge columns
+        common_cols = list(set(X.columns) & set(y.columns))
+        merge_candidates = ['time', 'sentid', 'sentpos', 'word', 'subject', 'item', 'zone']
+        merge_cols = [col for col in merge_candidates if col in common_cols]
+        
+        if not merge_cols:
+            raise ValueError("No suitable merge columns found for X and y")
+        
+        # Remove response from X if it exists to avoid duplication
+        if response_col in X.columns:
+            X = X.drop(columns=[response_col])
+        
+        # Merge
+        data_full = pd.merge(X, y, on=merge_cols, how='inner')
+        
+        # Filter invalid response times early
+        data_full = data_full[data_full[response_col] > 0].reset_index(drop=True)
+        
+        if split_by == 'sentence' and 'sentid' in data_full.columns:
+            # Split by sentences to prevent within-sentence leakage
+            unique_sentences = data_full['sentid'].unique()
+            print(f"\nTotal unique sentences: {len(unique_sentences)}")
+            
+            train_sents, val_sents = train_test_split(
+                unique_sentences,
+                test_size=test_size,
+                random_state=random_state
+            )
+            
+            train_mask = data_full['sentid'].isin(train_sents)
+            val_mask = data_full['sentid'].isin(val_sents)
+            
+            print(f"Training sentences: {len(train_sents)}")
+            print(f"Validation sentences: {len(val_sents)}")
+        else:
+            # Fall back to observation-level splitting
+            print("\nSplitting by individual observations")
+            indices = np.arange(len(data_full))
+            train_idx, val_idx = train_test_split(
+                indices,
+                test_size=test_size,
+                random_state=random_state
+            )
+            
+            train_mask = np.zeros(len(data_full), dtype=bool)
+            train_mask[train_idx] = True
+            val_mask = ~train_mask
+        
+        # Split the data
+        train_data_df = data_full[train_mask].copy()
+        val_data_df = data_full[val_mask].copy()
+        
+        print(f"\nTraining observations: {len(train_data_df)}")
+        print(f"Validation observations: {len(val_data_df)}")
+        
+        # Recreate X and y for each split
+        X_train = train_data_df[X.columns]
+        y_train = train_data_df[[response_col] + merge_cols]
+        
+        X_val = val_data_df[X.columns]
+        y_val = val_data_df[[response_col] + merge_cols]
+        
+        # Prepare training data and compute normalization parameters
+        print("\n--- Preparing TRAINING data ---")
+        train_cdr_data = prepare_reading_data_for_cdr(
+            X_train, y_train,
+            predictor_cols=predictor_cols,
+            response_col=response_col,
+            history_length=history_length,
+            future_length=future_length,
+            outlier_percentile=outlier_percentile,
+            use_log_transform=use_log_transform,
+            device=device,
+            compute_normalization=True,  # Compute fresh normalization
+            existing_normalization_params=None
+        )
+        
+        # Prepare validation data using training normalization parameters
+        print("\n--- Preparing VALIDATION data ---")
+        val_cdr_data = prepare_reading_data_for_cdr(
+            X_val, y_val,
+            predictor_cols=predictor_cols,
+            response_col=response_col,
+            history_length=history_length,
+            future_length=future_length,
+            outlier_percentile=outlier_percentile,
+            use_log_transform=use_log_transform,
+            device=device,
+            compute_normalization=False,  # Use training normalization
+            existing_normalization_params=train_cdr_data['normalization_params']
+        )
+        
+        # Use these for training
+        train_data = {
+            'response': train_cdr_data['response'],
+            'predictors': train_cdr_data['predictors'],
+            't_delta': train_cdr_data['t_delta'],
+            'mask': train_cdr_data['mask']
+        }
+        
+        val_data = {
+            'response': val_cdr_data['response'],
+            'predictors': val_cdr_data['predictors'],
+            't_delta': val_cdr_data['t_delta'],
+            'mask': val_cdr_data['mask']
+        }
+        
+        # Store the full CDR data and normalization params
+        cdr_data = train_cdr_data  # This will be returned
+        normalization_params = train_cdr_data['normalization_params']
+        
+    else:
+        # =====================================================================
+        # ORIGINAL METHOD (with potential leakage)
+        # =====================================================================
+        
+        # Prepare data with original method
+        cdr_data = prepare_reading_data_for_cdr(
+            X, y,
+            predictor_cols=predictor_cols,
+            response_col=response_col,
+            history_length=history_length,
+            future_length=future_length,
+            outlier_percentile=outlier_percentile,
+            use_log_transform=use_log_transform,
+            device=device,
+            compute_normalization=True,
+            existing_normalization_params=None
+        )
+        
+        print(f"\nTotal valid observations: {len(cdr_data['response']):,}")
+        
+        # Split data
+        n_obs = len(cdr_data['response'])
+        indices = np.arange(n_obs)
+        train_idx, val_idx = train_test_split(indices, test_size=test_size, random_state=random_state)
+        
+        # Create train/val splits
+        train_data = {
+            'response': cdr_data['response'][train_idx],
+            'predictors': cdr_data['predictors'][train_idx],
+            't_delta': cdr_data['t_delta'][train_idx],
+            'mask': cdr_data['mask'][train_idx]
+        }
+        
+        val_data = {
+            'response': cdr_data['response'][val_idx],
+            'predictors': cdr_data['predictors'][val_idx],
+            't_delta': cdr_data['t_delta'][val_idx],
+            'mask': cdr_data['mask'][val_idx]
+        }
+        
+        normalization_params = cdr_data['normalization_params']
+        val_cdr_data = None  # Not available in this mode
     
     print(f"\nTrain size: {len(train_data['response']):,}")
     print(f"Validation size: {len(val_data['response']):,}")
@@ -834,16 +926,22 @@ def run_neural_cdr(X, y,
     if visualize:
         results = visualize_results(
             model, history, val_data,
-            cdr_data['normalization_params'],
+            normalization_params,
             CDRDataset
         )
     
     print(f"\nTotal analysis time: {time.time() - total_start:.1f} seconds")
     
-    return {
+    return_dict = {
         'model': model,
         'data': cdr_data,
         'history': history,
         'results': results,
-        'normalization_params': cdr_data['normalization_params']
+        'normalization_params': normalization_params
     }
+    
+    # Add validation data if we're in prevent_leakage mode
+    if prevent_leakage and val_cdr_data is not None:
+        return_dict['val_data'] = val_cdr_data
+    
+    return return_dict

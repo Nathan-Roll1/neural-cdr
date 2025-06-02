@@ -18,8 +18,8 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 
-from utils_windows import NUMBA_AVAILABLE, create_windows_numba, create_windows_vectorized
-from visualize import visualize_results
+from .utils_windows import NUMBA_AVAILABLE, create_windows_numba, create_windows_vectorized
+from .visualize import visualize_results
 
 warnings.filterwarnings('ignore')
 

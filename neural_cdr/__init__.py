@@ -6,44 +6,23 @@ A GPU-accelerated PyTorch implementation of continuous-time deconvolutional
 regression with learned neural impulse response functions.
 """
 
-try:
-    # Try relative imports (package structure)
-    from .neural_cdr import (
-        run_neural_cdr,
-        CDRDataset,
-        ImprovedNeuralIRF,
-        ImprovedBlockLinearCDR,
-        prepare_reading_data_for_cdr,
-        train_model,
-        compute_r2
-    )
+from .neural_cdr import (
+    run_neural_cdr,
+    CDRDataset,
+    ImprovedNeuralIRF,
+    ImprovedBlockLinearCDR,
+    prepare_reading_data_for_cdr,
+    train_model,
+    compute_r2
+)
 
-    from .utils_windows import (
-        create_windows_numba,
-        create_windows_vectorized,
-        NUMBA_AVAILABLE
-    )
+from .utils_windows import (
+    create_windows_numba,
+    create_windows_vectorized,
+    NUMBA_AVAILABLE
+)
 
-    from .visualize import visualize_results
-except ImportError:
-    # Fall back to absolute imports (flat structure)
-    from neural_cdr import (
-        run_neural_cdr,
-        CDRDataset,
-        ImprovedNeuralIRF,
-        ImprovedBlockLinearCDR,
-        prepare_reading_data_for_cdr,
-        train_model,
-        compute_r2
-    )
-
-    from utils_windows import (
-        create_windows_numba,
-        create_windows_vectorized,
-        NUMBA_AVAILABLE
-    )
-
-    from visualize import visualize_results
+from .visualize import visualize_results
 
 __version__ = "1.0.0"
 __author__ = "Nathan Roll"
